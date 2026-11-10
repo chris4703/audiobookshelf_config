@@ -1,0 +1,27 @@
+# Independent example for a new deployment, not a copy of the author's live stack.
+# Change image version, host port, timezone, and storage to fit your environment.
+name: audiobookshelf-example
+
+services:
+  audiobookshelf:
+    image: ${AUDIOBOOKSHELF_IMAGE:?Set AUDIOBOOKSHELF_IMAGE to a reviewed release tag or digest}
+    restart: unless-stopped
+    ports:
+      # Loopback only. Any remote routing is configured separately.
+      - "127.0.0.1:${APP_PORT:-13378}:80"
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      # The directory must already exist; a typo must not create an empty library.
+      - type: bind
+        source: ${MEDIA_DIRECTORY:?Set MEDIA_DIRECTORY to an existing absolute media path}
+        target: /audiobooks
+        bind:
+          create_host_path: false
+      - app_config:/config
+      - app_metadata:/metadata
+
+volumes:
+  # These are dedicated to this example Compose project, not existing app volumes.
+  app_config:
+  app_metadata:

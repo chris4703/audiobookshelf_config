@@ -1,192 +1,116 @@
-# 📚 AudioBookshelf Homelab – Architecture & Automation Notes
+# Audiobookshelf Homelab
 
-**Host:** macOS (Apple Silicon)  
-**Primary App:** AudioBookshelf  
-**Storage:** Docker named volume (`storyteller_data`)  
-**External Media Drive:** G-RAID Thunderbolt volume  
-**Email Delivery:** Gmail SMTP via local relay (Kindle compatible)
+Architecture notes from Chris Clark’s personal Audiobookshelf setup: a media library on Apple Silicon, container-based storage, automated ingestion, and a small email integration for ebook delivery.
 
----
+The interesting part is how the pieces fit together: keeping media separate from application state, handling macOS permissions, and planning for backups without modifying the upstream application.
 
-## 1. High-Level Goals
+> **A reference setup, not a universal recipe.** The hardware and configuration below describe my own homelab. Your CPU architecture, operating system, storage, paths, permissions, ports, email provider, and backup needs may differ. Service names and schedules are examples, not a live inventory or a guarantee of current operating status.
 
-This AudioBookshelf setup is designed to:
+## At a glance
 
-- Keep **media storage isolated** in Docker volumes
-- Allow **hands-off ingestion** of new content
-- Maintain **safe, periodic backups**
-- Work around **macOS background permission restrictions**
-- Reliably deliver **ebooks to Kindle** using Send-to-Kindle requirements
-- Remain **upgrade-safe** (no forks of AudioBookshelf)
+| Component | My reference setup | What may differ in yours |
+| --- | --- | --- |
+| Host | Mac mini running macOS on Apple Silicon | Linux, another Mac, or other supported hardware; check image compatibility |
+| Container runtime | Docker Desktop | Docker Engine or another compatible environment |
+| External storage | G-RAID Thunderbolt storage | A different disk, NAS, or storage layout with suitable access and capacity |
+| Media storage | A Docker named volume called `storyteller_data` in the original notes | Your volume or bind mount; the name does not identify a particular physical drive |
+| Application state | Separate config and metadata volumes | Back up and restore the actual volumes used by your deployment |
+| Email | A private SMTP relay forwarding through Gmail | Your provider, sender policy, and delivery requirements |
+| Ingestion | A scheduled macOS workflow | Your scheduler, permissions model, and ingest process |
 
----
+An external drive and a Docker named volume are different layers. On Docker Desktop, a named volume is managed within Docker’s storage environment unless you have explicitly configured otherwise. Do not assume a volume is stored on an external disk just because one is attached.
 
-## 2. Core Docker Stack
+## What is in this repository
 
-### Containers
+- A description of the reference architecture and the reasoning behind it.
+- An independent [Audiobookshelf Compose example](examples/compose.yaml), with [placeholder settings](examples/.env.example).
+- Notes on ingestion, logging, backups, and the email workaround used in this setup.
 
-| Service | Purpose |
-|------|------|
-| `audiobookshelf` | Main AudioBookshelf server |
-| `abs-smtp-relay` | SMTP proxy to rewrite Kindle email subject |
+The custom SMTP relay, ingestion scripts, macOS app wrapper, and backup jobs are **not included**. The Compose example runs only the library application; it does not reproduce the full homelab. No media files, application databases, account credentials, or live deployment settings are included.
 
-### Volumes
+## Architecture
 
-| Volume | Purpose |
-|------|------|
-| `storyteller_data` (external) | Audiobooks & ebooks |
-| `audiobookshelf_config` | App configuration |
-| `audiobookshelf_metadata` | Metadata & database |
+```text
+Incoming media
+     │
+     ▼
+Scheduled ingest workflow ──────► Local logs
+     │
+     ▼
+Media storage ──────► Audiobookshelf
+                          │
+                          ├────► Separate config and metadata storage
+                          │
+                          └────► Private SMTP relay ───► Mail provider ───► Reader
 
----
-
-## 3. Docker Compose (Current State)
-
-```yaml
-services:
-  audiobookshelf:
-    image: ghcr.io/advplyr/audiobookshelf:latest
-    container_name: audiobookshelf
-    ports:
-      - "13378:80"
-    volumes:
-      - storyteller_data:/audiobooks
-      - audiobookshelf_config:/config
-      - audiobookshelf_metadata:/metadata
-    environment:
-      - TZ=America/Phoenix
-    restart: unless-stopped
-    depends_on:
-      - abs-smtp-relay
-
-  abs-smtp-relay:
-    build:
-      context: ./smtp-relay
-    container_name: abs-smtp-relay
-    restart: unless-stopped
-    environment:
-      LISTEN_PORT: "2525"
-      GMAIL_HOST: "smtp.gmail.com"
-      GMAIL_PORT: "587"
-      GMAIL_USER: "<gmail address>"
-      GMAIL_PASS: "<gmail app password>"
-
-volumes:
-  storyteller_data:
-    external: true
-  audiobookshelf_config:
-  audiobookshelf_metadata:
+Media + application state ──────► Separate backup storage
 ```
 
----
+The application uses the upstream Audiobookshelf image. Ingestion and email adaptations sit around it rather than requiring a fork.
 
-## 4. Automated Content Ingest
+## Adapt the Compose example
 
-### Problem (macOS-specific)
-- Background processes (launchd) **cannot reliably read `/Volumes/...`**
-- Even with Full Disk Access, background shells hit `Operation not permitted`
+The example is for a **new, separate deployment**. It is not a migration procedure for an existing library. It uses a media bind mount plus dedicated config and metadata volumes; this intentionally differs from the named media volume in the original reference setup.
 
-### Solution
-- A **LaunchAgent triggers a trusted `.app` wrapper**
-- The wrapper runs a shell script
-- All filesystem scanning happens **inside Docker**, not on the host
+1. Copy `examples/.env.example` to `examples/.env`.
+2. Replace `REPLACE_WITH_RELEASE` with an image release you have chosen and reviewed. Use a versioned tag or digest so updates are deliberate.
+3. Set `MEDIA_DIRECTORY` to the absolute path of your media directory. It must exist and be accessible to Docker. The example refuses to create a missing host directory.
+4. Adjust the host port and timezone for your environment.
+5. Validate before starting:
 
-### Key Ingest Behaviors
-- Runs every **5 minutes**
-- Checks `_incoming` folder *inside the container*
-- Merges folders cleanly into `/audiobooks`
-- Never overwrites existing files
-- Removes source files after successful copy
-- Logs locally, then mirrors logs to the external drive (best-effort)
+   ```sh
+   docker compose --env-file examples/.env -f examples/compose.yaml config --quiet
+   ```
 
----
+6. After reviewing the resolved configuration, start the example:
 
-## 5. macOS Permission Workaround (Critical)
+   ```sh
+   docker compose --env-file examples/.env -f examples/compose.yaml up -d
+   ```
 
-macOS applies privacy rules to background processes and removable volumes.
+With the example port unchanged, open `http://127.0.0.1:13378` on the Docker host and complete the application’s initial setup. If that port is already used, choose another in your private `.env` file.
 
-**Working pattern:**
-1. Wrap ingest script in a minimal `.app`
-2. Grant the app **Full Disk Access**
-3. LaunchAgent runs the app via `open -a`
-4. App executes the script with full volume access
+The example binds to loopback. Network access from other devices or a remote connection requires a separately reviewed routing and authentication setup. It does not configure a tunnel, email, ingestion, or backups. Do not point a second writable deployment at an existing library or application-state volume without planning the migration.
 
-This avoids SIP hacks or TCC database modification.
+## Ingestion and macOS permissions
 
----
+The original workflow checked an `_incoming` directory every five minutes, merged incoming content into the library without overwriting existing files, and removed source copies after successful transfer. That describes the intended workflow; its implementation is not distributed here.
 
-## 6. Logging Strategy
+During setup, background tasks encountered macOS permission restrictions around removable storage. The approach used a LaunchAgent to invoke an app wrapper, with appropriate filesystem access granted to that wrapper. File operations then ran in the configured container storage context.
 
-- **Primary:** `~/Library/Logs/abs_sync_incoming.log`
-- **Mirror:** `/Volumes/.../_logs/abs_sync_incoming.log` (best-effort)
+This is an observation from one environment, not a blanket statement that macOS background processes cannot access external drives. The result depends on the macOS version, responsible process, permissions, mount layout, and Docker file-sharing configuration. A container does not automatically bypass host permissions or gain access to an attached disk.
 
-External logging failures never stop the job.
+If you implement your own ingest job, verify duplicate handling, partial-copy recovery, and destination integrity before deleting source files. Test with disposable sample files first.
 
----
+## Logging
 
-## 7. Backups
+The reference setup kept a local operational log and attempted to mirror it to external storage. A failed mirror was intended to leave ingestion running while retaining the local log.
 
-### Media Volume
-- Monthly `tar.gz` snapshot of `storyteller_data`
-- `pigz -1` for fast multi-core compression
-- Excludes `image-cache/`
-- Retains **2 most recent archives**
+Choose paths and retention for your environment. Logs can include filenames, filesystem paths, or personal library details, so they belong outside the repository. The Compose example does not configure log mirroring.
 
-### Metadata
-- `/metadata/backups` copied separately
-- Enables DB restore without full media restore
+## Backup and recovery
 
----
+The original notes described monthly compressed media snapshots, two retained media archives, and a separate copy of metadata backups. Those settings describe that setup; they are not a recommended retention policy for every library and have not been reverified as current by this guide.
 
-## 8. Kindle Ebook Delivery
+A useful recovery plan accounts for:
 
-### Problem
-- Kindle requires email subject **`Convert`**
-- AudioBookshelf hard-codes subject text
+- Media files and any external datasets they depend on.
+- Application config, metadata, and database state.
+- The image version and configuration needed to reconstruct the service.
+- A separate backup destination and a tested restore procedure.
 
-### Solution
-A local SMTP relay:
-- Intercepts outgoing mail
-- Rewrites subject to `Convert` for `@kindle.com`
-- Forwards to Gmail SMTP using STARTTLS
+Use a consistent application/database backup method. A live volume archive alone does not establish database consistency. Validate a restore in an isolated environment before relying on a backup, and choose frequency and retention based on how much change you can afford to lose.
 
-No AudioBookshelf fork required.
+## Email integration
 
----
+The reference setup used a private relay to rewrite the subject to `Convert` for ebook messages addressed to Kindle recipients, then forwarded them through Gmail using STARTTLS. This was an integration workaround used in that environment, not a claim that every Kindle delivery or Audiobookshelf release requires it.
 
-## 9. Email Flow
+The relay is not included in this repository. If you build a similar integration, check the current requirements of your application, mail provider, and receiving service. Sender authorization, supported file types, and conversion behavior may vary.
 
-```
-AudioBookshelf
-   ↓
-abs-smtp-relay (subject rewrite)
-   ↓
-Gmail SMTP
-   ↓
-Amazon Send-to-Kindle
-   ↓
-Kindle device
-```
+Keep real SMTP credentials, app passwords, and recipient addresses in private runtime configuration. The public Compose example does not request or embed email credentials.
 
----
+## Public documentation and privacy
 
-## 10. Known Good State
+Hardware descriptions are intentionally shared. Actual account identifiers, credentials, library contents, databases, logs, and runtime configuration are not. See [PUBLICATION.md](PUBLICATION.md) for the release scope and checks.
 
-- Incoming auto-ingests
-- Logs update every 5 minutes
-- Kindle deliveries succeed
-- No background permission errors
-- Docker restarts cleanly
-
----
-
-## 11. Design Philosophy
-
-This setup prioritizes:
-
-- Predictability
-- Observability
-- Recoverability
-
-It is intentionally boring—and therefore reliable.
-
+This is an independent personal homelab guide, not the official Audiobookshelf project. For application support and current image/release documentation, use the [upstream project](https://github.com/advplyr/audiobookshelf).
